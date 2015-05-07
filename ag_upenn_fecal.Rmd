@@ -1,0 +1,396 @@
+---
+title: "American Gut - Fecal Analysis"
+author: "Kyle Bittinger"
+date: "4/2/2015"
+output: pdf_document
+---
+
+```{r global_options, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(
+  fig.width=7, fig.height=5, 
+  cache=TRUE, echo=FALSE, 
+  warning=FALSE, message=FALSE)
+```
+
+
+## Initialization
+
+```{r libs}
+library(qiimer)
+library(kylemisc)
+library(ape)
+library(Hmisc)
+library(ggplot2)
+library(vegan)
+library(plyr)
+library(dplyr)
+library(doMC)
+library(stringr)
+registerDoMC(3)
+```
+
+```{r funcs}
+rm_prefix <- function (x) sub("^[A-Z]+:", "", x, perl=T)
+self_name <- function (x) {
+  names(x) <- x
+  x
+}
+#' Distance between group centroids
+centroid_distance <- function(d, idx1, idx2) {
+  d <- as.dist(d)
+  # Within-group distances, group 1
+  n1 <- length(idx1)
+  ss1 <- sum(dist_subset(d, idx1) ** 2)
+  # Within-group distances, group 2
+  n2 <- length(idx2)
+  ss2 <- sum(dist_subset(d, idx2) ** 2)
+  # Between-group distances
+  idx12 <- expand.grid(idx1, idx2, stringsAsFactors = F)
+  ss12 <- sum(dist_get(d, idx12[,1], idx12[,2]) ** 2)
+  # Re-arrange Eq. 28 in Apostol and Mnatsakanian
+  # Math. Assoc. Am. Monthly 110, 516 (2013)
+  # Solve for centroid distance, |c_1 - c_2|
+  # Assuming equal weights, W_1 = n_1 and W_2 = n_2
+  term1 <- ss12 / (n1 * n2)
+  term2 <- ss1 / (n1 * n1)
+  term3 <- ss2 / (n2 * n2)
+  sqrt(term1 - term2 - term3)
+}
+```
+
+## Data Input - Fecal only
+
+```{r levels}
+never_daily_levels <- c(
+    "Never", "Rarely (few times/month)", "Occasionally (1-2 times/week)", 
+    "Regularly (3-5 times/week)", "Daily")
+abx_levels <- c(
+  "Not in the last year", "In the past year", "In the past 6 months", 
+  "In the past month", "In the past week")
+abx_nums <- c("18", "9.5", "3", "0.75", "0.125")
+plant_levels <- c(
+  "Less than 5", "6 to 10", "11 to 20", "21 to 30", "More than 30")
+plant_nums <- c("2.5", "8", "15.5", "25.5", "35.5")
+bmi_levels <- c("Underweight", "Normal", "Overweight", "Obese")
+seasons <- c("Winter", "Spring", "Summer", "Fall")
+```
+
+```{r}
+fix_sample_df <- function (sample_df) {
+  colnames(sample_df)[1] <- "SampleID"
+
+  sample_df <- within(sample_df, {
+    SampleID <- as.character(SampleID)
+  
+    COLLECTION_MONTH <- factor(COLLECTION_MONTH, levels=month.name)
+    MonthNum <- as.numeric(COLLECTION_MONTH) - 1
+    CosineMonth <- cos(MonthNum * 2 * pi / 12)
+  
+    # One sample has 28 plants/week -- set to 21 - 30
+    TYPES_OF_PLANTS[TYPES_OF_PLANTS %in% "28"] <- "21 to 30"
+    TYPES_OF_PLANTS <- factor(TYPES_OF_PLANTS, levels=plant_levels)
+    PlantNum <- TYPES_OF_PLANTS
+    levels(PlantNum) <- plant_nums
+    PlantNum <- as.numeric(as.character(PlantNum))
+  
+    AGE <- as.numeric(as.character(AGE))
+    LogAge <- log(AGE)
+  
+    ANTIBIOTIC_SELECT <- factor(ANTIBIOTIC_SELECT, levels=abx_levels)
+    AbxNum <- ANTIBIOTIC_SELECT
+    levels(AbxNum) <- abx_nums
+    AbxNum <- as.numeric(as.character(AbxNum))
+    LogAbx <- log(AbxNum)
+    
+    ALCOHOL_FREQUENCY <- factor(ALCOHOL_FREQUENCY, levels=never_daily_levels)
+    EXERCISE_FREQUENCY <- factor(EXERCISE_FREQUENCY, levels=never_daily_levels)
+    BMI <- as.numeric(as.character(BMI))
+    BMI_CAT <- factor(BMI_CAT, levels=bmi_levels)
+    
+    COLLECTION_SEASON <- factor(COLLECTION_SEASON, levels=seasons)
+    
+    LATITUDE <- as.numeric(as.character(LATITUDE))
+    
+    HasIBD <- IBD != "I do not have IBD"
+  })
+}
+```
+
+Load full set of fecal samples.
+
+```{r}
+s_all <- read.delim(
+  "fecal/all_participants_one_sample/AGP_100nt_even10k_fecal.txt", 
+  na.strings=c("", "no_data", "unknown"))
+s_all <- fix_sample_df(s_all)
+```
+
+```{r}
+uu_all <- read_qiime_distmat(
+  "fecal/all_participants_one_sample/unweighted_unifrac_AGP_100nt_even10k_fecal.txt")
+uu_all <- dist_subset(uu_all, s_all$SampleID)
+wt_all <- read_qiime_distmat(
+  "fecal/all_participants_one_sample/weighted_unifrac_AGP_100nt_even10k_fecal.txt")
+wt_all <- dist_subset(wt_all, s_all$SampleID)
+```
+
+Load subset of fecal samples: no antibiotics in the past year, no IBD, no diabetes, ages 20-70.
+
+```{r}
+s_h20 <- read.delim(
+  "fecal/sub_participants_one_sample/AGP_100nt_even10k_fecal.txt", 
+  na.strings=c("", "no_data", "unknown"))
+s_h20 <- fix_sample_df(s_h20)
+```
+
+```{r}
+uu_h20 <- read_qiime_distmat(
+  "fecal/sub_participants_one_sample/unweighted_unifrac_AGP_100nt_even10k_fecal.txt")
+uu_h20 <- dist_subset(uu_h20, s_h20$SampleID)
+wt_h20 <- read_qiime_distmat(
+  "fecal/sub_participants_one_sample/weighted_unifrac_AGP_100nt_even10k_fecal.txt")
+wt_h20 <- dist_subset(wt_h20, s_h20$SampleID)
+```
+
+## Beta diversity: 1-way analyses
+
+Repeat figures in outline and provide effect sizes. Tests in outline cover the following variables (H20 means no antibiotics in the past year, no IBD, no diabetes, ages 20-70):
+
+* Age by decade (H20)
+* Most recent abx use (No IBD, No Diabetes, ages 20-69, BMI 18.5-30)
+* IBD diagnosis
+* BMI (No Antibiotics, No IBD, no diabetes, ages 20-70)
+* Frequency of alcohol use (H20)
+* Collection season (H20)
+* Exercise frequency (H20)
+* Sleep duration (H20)
+* Number of types of plants consumed in a week (H20)
+
+
+```{r}
+adonis_1way <- function (sample_df, sample_dist, colname) {
+  row_ok <- !is.na(sample_df[[colname]])
+  s1 <- sample_df[row_ok,]
+  dm1 <- dist_subset(sample_dist, s1$SampleID)
+  f1 <- formula(paste("dm1 ~", colname))
+  set.seed(1)
+  adonis(f1, s1, permutations = 99)
+}
+```
+
+```{r}
+dists_to_ref <- function (df, dm, g, ref) {
+  sample_ids <- df[!is.na(g),"SampleID"]
+  g <- g[!is.na(g)]
+  s1 <- sample_ids[g %in% ref]
+  dist_df <- expand.grid(
+    RefSample=s1, TargetSample=sample_ids, 
+    stringsAsFactors = F)
+  dist_df$RefLev <- ref
+  dist_df$TargetLev <- g[match(dist_df$TargetSample, sample_ids)]
+  dist_df$Distance <- dist_get(
+    dm, dist_df$RefSample, dist_df$TargetSample)
+  dist_df
+}
+ave_dists <- function (df, dm, g) {
+  ldply(self_name(levels(g)), function (lev) {
+    dist_df <- dists_to_ref(df, dm, g, lev)
+    ddply(
+      dist_df, .(TargetLev), summarize, 
+      Mean = mean(Distance), StdDev = sd(Distance))
+  }, .id = "RefLev")
+}
+show_ave_dists <- function (df, dm, g) {
+  dist_df <- ave_dists(df, dm, g)
+  ggplot(dist_df) + 
+  geom_point(aes(x=TargetLev, y=Mean, color=TargetLev), stat="identity") + 
+  geom_segment(aes(x=TargetLev, xend=TargetLev, y=Mean, yend=Mean+StdDev)) +
+  facet_wrap(~ RefLev) +
+  labs(color="", x="Target level", y="Mean distance between samples") +
+  theme_classic() + theme(
+    axis.text.x=element_text(angle=90, hjust=1, vjust=0.5))
+}
+```
+
+### Age
+
+Test age categories.  Might be better to regress against age directly.
+
+```{r}
+table(Age=s_h20$AGE_CAT, useNA = "ifany")
+adonis_1way(s_h20, uu_h20, "AGE_CAT")
+show_ave_dists(s_h20, uu_h20, s_h20$AGE_CAT)
+```
+
+### Antibiotics
+
+Test abx use.  Abnormally large variation for past week abx suggests we should test for dispersion differences here.
+
+```{r}
+s_abx <- subset(s_all, (
+  !is.na(IBD) & !is.na(DIABETES) & !is.na(AGE) & !is.na(BMI)))
+s_abx <- subset(s_abx, (
+  (IBD %in% "I do not have IBD") & 
+    (DIABETES %in% "I do not have diabetes") &
+    (AGE >= 20) & (AGE <= 69) &
+    (BMI >= 18.5) & (BMI <= 30)))
+table(Antibiotics=s_abx$ANTIBIOTIC_SELECT, useNA = "ifany")
+adonis_1way(s_abx, uu_all, "ANTIBIOTIC_SELECT")
+show_ave_dists(s_abx, uu_all, s_abx$ANTIBIOTIC_SELECT)
+```
+
+### IBD
+
+Test IBD diagnosis.  Figure does not match text, probably due to inclusion criteria.
+
+```{r}
+table(IBD=s_all$IBD, useNA = "ifany")
+adonis_1way(s_all, uu_all, "IBD")
+show_ave_dists(s_all, uu_all, s_all$IBD)
+```
+
+### BMI
+
+Test BMI.  Again, figure is slightly different from outline.
+
+```{r}
+s_bmi <- subset(s_all, (
+  !is.na(ANTIBIOTIC_SELECT) &
+    !is.na(IBD) & !is.na(DIABETES) & !is.na(AGE)))
+s_bmi <- subset(s_bmi, (
+  (ANTIBIOTIC_SELECT %in% "Not in the last year") &
+    (IBD %in% "I do not have IBD") & 
+    (DIABETES %in% "I do not have diabetes") &
+    (AGE >= 20) & (AGE <= 70)))
+table(BMI=s_bmi$BMI_CAT, useNA = "ifany")
+adonis_1way(s_bmi, uu_all, "BMI_CAT")
+show_ave_dists(s_bmi, uu_all, s_bmi$BMI_CAT)
+```
+
+### Alcohol consumption
+
+Test alcohol frequency.
+
+```{r}
+table(Alcohol=s_h20$ALCOHOL_FREQUENCY, useNA = "ifany")
+adonis_1way(s_h20, uu_h20, "ALCOHOL_FREQUENCY")
+show_ave_dists(s_h20, uu_h20, s_h20$ALCOHOL_FREQUENCY)
+```
+
+### Collection season
+
+Test collection season.  Surprisingly large effect, in relative terms.
+
+```{r}
+table(Season=s_h20$COLLECTION_SEASON, useNA = "ifany")
+adonis_1way(s_h20, uu_h20, "COLLECTION_SEASON")
+show_ave_dists(s_h20, uu_h20, s_h20$COLLECTION_SEASON)
+```
+
+### Exercise
+
+Test exercise frequency.
+
+```{r}
+table(Exercise=s_h20$EXERCISE_FREQUENCY, useNA = "ifany")
+adonis_1way(s_h20, uu_h20, "EXERCISE_FREQUENCY")
+show_ave_dists(s_h20, uu_h20, s_h20$EXERCISE_FREQUENCY)
+```
+
+### Sleep duration
+
+Test sleep duration.  Not significant overall.
+
+```{r}
+table(Sleep=s_h20$SLEEP_DURATION, useNA = "ifany")
+adonis_1way(s_h20, uu_h20, "SLEEP_DURATION")
+show_ave_dists(s_h20, uu_h20, s_h20$SLEEP_DURATION)
+```
+
+### Types of plants eaten
+
+Test number of types of plants eaten.  Relatively large effect.
+
+```{r}
+table(`Types of plants`=s_h20$TYPES_OF_PLANTS, useNA = "ifany")
+adonis_1way(s_h20, uu_h20, "TYPES_OF_PLANTS")
+show_ave_dists(s_h20, uu_h20, s_h20$TYPES_OF_PLANTS)
+```
+
+
+## Beta diversity: multivariate models
+
+Build a multivariate model using method described for alpha diversity.  Kind of tricky as there is no expression for AIC with distance measures.  Will use the model determined for alpha diversity to evaluate beta diversity.
+
+```{r}
+aic_approx <- function (adonis_result) {
+  aov_tab <- adonis_result$aov.tab
+  rss <- aov_tab["Residuals", "R2"]
+  num_terms <- nrow(aov_tab) - 2
+  log(rss)  + (2 * num_terms)
+}
+```
+
+
+```{r}
+adonis_multi <- function (df, dm, terms, nperm=9) {
+  df_is_na <- apply(
+    data.matrix(as.data.frame(lapply(df, is.na))), 
+    2, as.logical)
+  
+  # Filter sample set
+  indiv_terms <- do.call(c, str_split(terms, perl("\\*|\\:")))
+  na_matrix <- df_is_na[,indiv_terms, drop=FALSE]
+  # Keep if we do not see any NAs
+  rows_to_keep <- !apply(na_matrix, 1, any)
+  message("Num rows included:", sum(rows_to_keep))
+  df1 <- df[rows_to_keep,]
+    
+  # Filter distances
+  dm1 <- dist_subset(dm, df1$SampleID)
+    
+  # Make the formula
+  rhs <- paste(terms, collapse = " + ")
+  f1_char <- paste("dm1 ~", rhs)
+  message("Formula: ", f1_char)
+  f1 <- formula(f1_char)
+    
+  # Run PERMANOVA
+  set.seed(1)
+  res <- adonis(f1, df1, permutations = nperm)
+  res$AIC <- aic_approx(res)
+  res
+}
+```
+
+Select samples from alpha diversity multivariate fit.
+
+```{r}
+s_b20 <- subset(s_all, !is.na(AGE) & !is.na(BMI) & !is.na(LATITUDE))
+s_b20 <- subset(s_b20, (AGE >= 20) & (BMI < 40) & (LATITUDE > 0))
+uu_b20 <- dist_subset(uu_all, s_b20$SampleID)
+wt_b20 <- dist_subset(wt_all, s_b20$SampleID)
+```
+
+Multivariate model for unweighted UniFrac distance.
+
+```{r}
+alpha_model <- adonis_multi(s_b20, uu_b20, terms=c(
+  "ANTIBIOTIC_SELECT", "HasIBD", "ANTIBIOTIC_SELECT:HasIBD",
+  "TYPES_OF_PLANTS", "ALCOHOL_FREQUENCY", "EXERCISE_FREQUENCY",
+  "SLEEP_DURATION", "EXERCISE_LOCATION", "AGE", "COLLECTION_SEASON",
+  "COLLECTION_SEASON:LATITUDE"), nperm=999)
+alpha_model
+```
+
+Multivariate model for weighted UniFrac Distance.
+
+```{r}
+alpha_model_weighted <- adonis_multi(s_b20, wt_b20, terms=c(
+  "ANTIBIOTIC_SELECT", "HasIBD", "ANTIBIOTIC_SELECT:HasIBD",
+  "TYPES_OF_PLANTS", "ALCOHOL_FREQUENCY", "EXERCISE_FREQUENCY",
+  "SLEEP_DURATION", "EXERCISE_LOCATION", "AGE", "COLLECTION_SEASON",
+  "COLLECTION_SEASON:LATITUDE"), nperm=999)
+alpha_model_weighted
+```
